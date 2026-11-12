@@ -51,6 +51,21 @@ def xlsx_path(arg: str | None) -> str:
     return arg or os.path.join(_catalog.repo_root(), DEFAULT_XLSX)
 
 
+def save_book(wb, path: str) -> None:
+    """Save atomically: write a temp file beside the workbook, then rename over it.
+
+    The workbook IS the resumable state; a crash or full disk halfway through wb.save() used to
+    leave a truncated .xlsx and lose the whole run.
+    """
+    tmp = f"{path}.tmp-{os.getpid()}"
+    try:
+        wb.save(tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
 def open_book(path: str):
     if os.path.exists(path):
         return openpyxl.load_workbook(path)
@@ -116,6 +131,8 @@ def write(ws, hdr: dict[str, int], row: int, values: dict[str, str | None]) -> N
         if column not in hdr:
             raise SystemExit(f"tab '{ws.title}' has no '{column}' column")
         cell = ws.cell(row=row, column=hdr[column], value=value)
+        if isinstance(value, str) and value.startswith("="):
+            cell.data_type = "s"   # text from changelogs/logs must never become a live formula
         cell.font = Font(name="Arial", size=10)
         cell.alignment = Alignment(wrap_text=True, vertical="top")
         if column == "status":
@@ -173,7 +190,7 @@ def cmd_init(a) -> None:
             "code changes": "DIVERGED: " + entry["note"] if entry["state"] == "diverged" else "",
         })
         added += 1
-    wb.save(a.xlsx)
+    save_book(wb, a.xlsx)
     print(f"tracker: {added} row(s) added, {kept} already present (left untouched) -> {a.xlsx}")
 
 
@@ -195,7 +212,7 @@ def cmd_set(a) -> None:
                                  "modules affected": a.modules, "tier": a.tier,
                                  "official docs": a.docs,
                                  "changelog highlights": a.highlights})
-            wb.save(a.xlsx)
+            save_book(wb, a.xlsx)
             print(f"  {a.ref} [{TABS[part]}]: " + (f"status={a.status}" if a.status else "updated"))
             return
     raise SystemExit(f"{a.ref} not found in {[TABS[p] for p in parts]}")

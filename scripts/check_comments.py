@@ -91,6 +91,7 @@ def platform_at(rev: str | None) -> tuple:
 
 def blame(line: int, rev: str | None) -> str | None:
     """Commit that last touched `line` (None when it is uncommitted)."""
+    _catalog.check_rev(rev)
     cmd = ["git", "blame", "--porcelain", "-L", f"{line},{line}"]
     if rev:
         cmd.append(rev)

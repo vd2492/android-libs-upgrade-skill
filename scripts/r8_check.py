@@ -74,7 +74,7 @@ def mapping_dir(variant: str) -> str:
 def snap_path(name: str) -> str:
     d = os.path.join(_catalog.repo_root(), "build", "lib-upgrade", "r8")
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, f"{name}.json")
+    return os.path.join(d, f"{_catalog.safe_name(name)}.json")
 
 
 def read_state(variant: str) -> dict:

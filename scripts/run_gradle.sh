@@ -18,7 +18,18 @@ if [ "$#" -lt 2 ]; then
   exit 2
 fi
 name="$1"; shift
-root="$(git rev-parse --show-toplevel)"
+case "$name" in
+  ""|.*|*[!A-Za-z0-9._-]*) echo "run name must be letters, digits, . _ - (and not start with a dot): '$name'" >&2; exit 2 ;;
+esac
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || root=""
+if [ -z "$root" ] || [ ! -d "$root" ]; then
+  echo "not inside a git repository - run this from the Gradle project" >&2
+  exit 2
+fi
+if [ ! -x "$root/gradlew" ]; then
+  echo "no executable ./gradlew at $root" >&2
+  exit 2
+fi
 dir="$root/build/lib-upgrade/runs"
 mkdir -p "$dir"
 log="$dir/$name.log"; rc="$dir/$name.rc"; start="$dir/$name.start"

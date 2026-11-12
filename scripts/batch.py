@@ -105,7 +105,11 @@ def cmd_plan(a) -> None:
         elif held_by_comment(cat, ref):
             excluded.append((ref, held_by_comment(cat, ref)))
         else:
-            best = screen_gates.bisect(cat, ref, compile_sdk, kotlin, quiet=True)
+            try:
+                best = screen_gates.bisect(cat, ref, compile_sdk, kotlin, quiet=True)
+            except SystemExit as e:   # unreachable repo / not published: stays on the one-lib loop
+                excluded.append((ref, str(e)))
+                continue
             current = cat.versions[ref].value
             if best is None:
                 excluded.append((ref, "no stable version above the current one passes both gates"))

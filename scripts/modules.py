@@ -28,6 +28,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _catalog  # noqa: E402
 
+# End of a catalog accessor: not a longer name (libs.foo vs libs.foo.bar) but still a match when the
+# accessor is followed by a Provider call - libs.versions.compose.get(), libs.x.asProvider() -
+# which is how most build files read a version.
+ACCESSOR_END = (r"(?![\w-])(?!\.(?!(?:get|asProvider|toInt|toString|orNull|getOrElse|map|flatMap|isPresent)\b)\w)")
+
 ANDROID_BASE = r"com\.android\.(library|application)|\bandroid\s*\{|libs\.plugins\.android"
 
 
@@ -47,7 +52,7 @@ def android_regex() -> "re.Pattern":
             parts.append(re.escape(pid))
             for alias, art in plugins.items():
                 if art.group == pid:
-                    parts.append(rf"libs\.plugins\.{re.escape(_catalog.accessor(alias))}(?![\w.])")
+                    parts.append(rf"libs\.plugins\.{re.escape(_catalog.accessor(alias))}{ACCESSOR_END}")
     return re.compile("|".join(parts))
 
 
@@ -72,6 +77,20 @@ def build_file(d: str) -> str | None:
     return None
 
 
+TEST_SOURCE_SETS = re.compile(r"^(test|commonTest|androidUnitTest|jvmTest|test[A-Z]\w*)$")
+
+
+def has_unit_tests(module_dir: str) -> bool:
+    """True when any unit-test source set (src/test, src/commonTest, src/androidUnitTest, ...) has sources."""
+    src = os.path.join(module_dir, "src")
+    try:
+        sets = [n for n in os.listdir(src) if TEST_SOURCE_SETS.match(n)]
+    except OSError:
+        return False
+    return any(f.endswith((".kt", ".java")) for n in sets
+               for _, _, fs in os.walk(os.path.join(src, n)) for f in fs)
+
+
 def projects() -> list[dict]:
     s = settings_text()
     overrides = dict(re.findall(r"""project\(\s*['"](:[^'"]+)['"]\s*\)\.projectDir\s*=\s*file\(\s*['"]([^'"]+)['"]\s*\)""", s))
@@ -81,7 +100,7 @@ def projects() -> list[dict]:
     # include ':a', ':b'  /  include(":a", ":b")  /  include(":a")  - every quoted path in the call
     incs = []
     s_nocomments = re.sub(r"//[^\n]*|/\*.*?\*/", "", s, flags=re.S)
-    for m in re.finditer(r"""(?<![\w.])include(?=[\s(])\s*(?:\(([^)]*)\)|([^\n]+))""", s_nocomments):
+    for m in re.finditer(r"""(?<![\w.])include(?=[\s(])\s*(?:\(([^)]*)\)|((?:[^\n]*,[ \t]*\n)*[^\n]+))""", s_nocomments):
         incs += re.findall(r"""['"](:?[^'"]+)['"]""", m.group(1) or m.group(2) or "")
     for inc in incs:
         path = inc if inc.startswith(":") else ":" + inc
@@ -92,9 +111,7 @@ def projects() -> list[dict]:
         bf = build_file(d)
         text = open(bf, encoding="utf-8", errors="ignore").read() if bf else ""
         android = bool(android_rx.search(text))
-        tdir = os.path.join(root(), d, "src", "test")
-        has_tests = os.path.isdir(tdir) and any(f.endswith((".kt", ".java"))
-                                                for _, _, fs in os.walk(tdir) for f in fs)
+        has_tests = has_unit_tests(os.path.join(root(), d))
         out.append({"path": path, "dir": d, "build": bf, "android": android,
                     "task": f"{path}:{unit_test}" if android else f"{path}:test",
                     "has_tests": has_tests})
@@ -124,17 +141,17 @@ def routes_for(cat: _catalog.Catalog, ref: str) -> tuple[list[tuple[str, str]], 
     """((regex, label) routes, names a convention plugin could look up, hardcoded coordinates)."""
     libs = [a for a in cat.libraries.values() if a.version_ref == ref]
     plugs = [a for a in cat.plugins.values() if a.version_ref == ref]
-    accs = [(rf"libs\.{re.escape(_catalog.accessor(a.alias))}(?![\w.])", f"libs.{_catalog.accessor(a.alias)}")
+    accs = [(rf"libs\.{re.escape(_catalog.accessor(a.alias))}{ACCESSOR_END}", f"libs.{_catalog.accessor(a.alias)}")
             for a in libs]
-    accs += [(rf"libs\.plugins\.{re.escape(_catalog.accessor(p.alias))}(?![\w.])",
+    accs += [(rf"libs\.plugins\.{re.escape(_catalog.accessor(p.alias))}{ACCESSOR_END}",
               f"libs.plugins.{_catalog.accessor(p.alias)}") for p in plugs]
     # Plugins are also applied by id string: `id 'com.google.firebase.crashlytics'`, `id("x")`.
     accs += [(rf"""\bid\s*\(?\s*['"]{re.escape(p.group)}['"]""", f"id '{p.group}'") for p in plugs if p.group]
-    accs.append((rf"libs\.versions\.{re.escape(_catalog.accessor(ref))}(?![\w.])", f"libs.versions.{_catalog.accessor(ref)}"))
+    accs.append((rf"libs\.versions\.{re.escape(_catalog.accessor(ref))}{ACCESSOR_END}", f"libs.versions.{_catalog.accessor(ref)}"))
     lib_accs = {_catalog.accessor(a.alias) for a in libs}
     bundles = [b for b, members in cat.bundles.items()
                if any(_catalog.accessor(m) in lib_accs for m in members)]
-    accs += [(rf"libs\.bundles\.{re.escape(_catalog.accessor(b))}(?![\w.])", f"libs.bundles.{_catalog.accessor(b)}")
+    accs += [(rf"libs\.bundles\.{re.escape(_catalog.accessor(b))}{ACCESSOR_END}", f"libs.bundles.{_catalog.accessor(b)}")
              for b in bundles]
     names = [a.alias for a in libs] + bundles + [ref]
     coords = [f"{a.group}:{a.name}:" for a in libs if a.group and a.name]
@@ -169,7 +186,7 @@ def consumers(ref: str) -> list[dict]:
         plugin = pid.get(cls)
         if not plugin:
             continue
-        rx = re.compile(rf"libs\.plugins\.{re.escape(_catalog.accessor(plugin))}(?![\w.])|['\"]{re.escape(plugin)}['\"]")
+        rx = re.compile(rf"libs\.plugins\.{re.escape(_catalog.accessor(plugin))}{ACCESSOR_END}|['\"]{re.escape(plugin)}['\"]")
         for p in projs:
             if p["build"] and rx.search(open(p["build"], encoding="utf-8", errors="ignore").read()):
                 entry = hits.setdefault(p["path"], {**p, "how": [], "hardcoded": []})

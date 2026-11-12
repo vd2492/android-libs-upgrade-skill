@@ -38,7 +38,7 @@ import studio  # noqa: E402
 
 def line(v: str) -> tuple[int, ...]:
     """major.minor of a version: the Kotlin metadata line."""
-    return _maven.key(v)[:2]
+    return (_maven.nums(v) + (0, 0))[:2]
 
 
 def screen_coord(group: str, artifact: str, v: str, compile_sdk: int, kotlin: str) -> dict:
@@ -48,24 +48,33 @@ def screen_coord(group: str, artifact: str, v: str, compile_sdk: int, kotlin: st
     status = meta["status"]
     needs: list[tuple[str, str]] = []
     if status == "ok":
-        mcs = int(meta.get("minCompileSdk", "1"))
-        g1 = ("PASS", f"minCompileSdk={mcs}") if mcs <= compile_sdk else \
-             ("FAIL", f"minCompileSdk={mcs} > compileSdk {compile_sdk}")
-        if mcs > compile_sdk:
-            needs.append(("compileSdk", str(mcs)))
+        try:
+            mcs = int(str(meta.get("minCompileSdk", "1")).strip())
+        except ValueError:
+            mcs = None
+        if mcs is None:
+            g1 = ("UNKNOWN", f"unreadable minCompileSdk {meta.get('minCompileSdk')!r}")
+        else:
+            g1 = ("PASS", f"minCompileSdk={mcs}") if mcs <= compile_sdk else \
+                 ("FAIL", f"minCompileSdk={mcs} > compileSdk {compile_sdk}")
+            if mcs > compile_sdk:
+                needs.append(("compileSdk", str(mcs)))
     elif status in ("none", "jar"):
         g1 = ("PASS", "no AAR metadata (unconstrained)" if status == "none" else "plain JAR")
     else:
         g1 = ("UNKNOWN", "download failed - NOT the same as 'no metadata'")
-    stdlibs = _maven.kotlin_stdlib(g, a, ver)
-    if not stdlibs:
+    stdlibs, unresolved = _maven.kotlin_stdlib_declared(g, a, ver)
+    if stdlibs and line(max(stdlibs, key=_maven.key)) > line(kotlin):
+        worst = max(stdlibs, key=_maven.key)
+        g2 = ("FAIL", f"kotlin-stdlib {worst} is on a newer line than project Kotlin {kotlin}")
+        needs.append(("Kotlin", ".".join(str(n) for n in line(worst))))
+    elif unresolved:
+        g2 = ("UNKNOWN", "kotlin-stdlib is declared but its version is not readable here (parent POM, "
+                         "BOM, range or ${property}) - check the dependency tree by hand")
+    elif not stdlibs:
         g2 = ("PASS", "no kotlin-stdlib declared")
     else:
-        worst = max(stdlibs, key=_maven.key)
-        g2 = ("PASS", f"kotlin-stdlib {worst}") if line(worst) <= line(kotlin) else \
-             ("FAIL", f"kotlin-stdlib {worst} is on a newer line than project Kotlin {kotlin}")
-        if line(worst) > line(kotlin):
-            needs.append(("Kotlin", ".".join(str(n) for n in line(worst))))
+        g2 = ("PASS", f"kotlin-stdlib {max(stdlibs, key=_maven.key)}")
     verdicts = {g1[0], g2[0]}
     verdict = "FAIL" if "FAIL" in verdicts else "UNKNOWN" if "UNKNOWN" in verdicts else "PASS"
     return {"coord": shown, "verdict": verdict, "gate1": g1, "gate2": g2, "needs": needs}
@@ -97,7 +106,12 @@ def screen_ref_at(cat, ref: str, v: str, compile_sdk: int, kotlin: str) -> dict:
     results, missing, seen = [], [], set()
     used = {(x.group, x.name) for x in cat.libraries.values() if x.group and x.name}
     for art in arts:
-        _, published = _maven.versions(art.group, art.name)
+        try:
+            _, published = _maven.versions(art.group, art.name)
+        except _maven.Unreachable as e:
+            results.append({"coord": f"{art.group}:{art.name}:{v}", "verdict": "UNKNOWN",
+                            "gate1": ("UNKNOWN", f"repository unreachable: {e}"), "gate2": ("UNKNOWN", "-")})
+            continue
         if v not in published:
             missing.append(f"{art.group}:{art.name}")
             continue
@@ -132,6 +146,17 @@ def screen_ref_at(cat, ref: str, v: str, compile_sdk: int, kotlin: str) -> dict:
     else:
         verdict = "PASS"
     return {"version": v, "verdict": verdict, "results": results, "missing": missing}
+
+
+def published_or_exit(art) -> list[str]:
+    """Published versions, or exit 3: 'repository unreachable' must never read as 'already latest'."""
+    try:
+        _, published = _maven.versions(art.group, art.name)
+    except _maven.Unreachable as e:
+        raise SystemExit(f"UNKNOWN: {e} - no conclusion about newer versions; retry when online")
+    if not published:
+        raise SystemExit(f"UNKNOWN: no maven-metadata.xml found for {art.group}:{art.name} in any repository")
+    return published
 
 
 def primary(cat, ref: str):
@@ -197,7 +222,7 @@ def print_studio(ref: str, version: str) -> None:
 def bisect(cat, ref: str, compile_sdk: int, kotlin: str, quiet: bool = False) -> str | None:
     art = primary(cat, ref)
     current = cat.versions[ref].value
-    _, published = _maven.versions(art.group, art.name)
+    published = published_or_exit(art)
     cands = _maven.stable_candidates(published, current)
     if not cands:
         if not quiet:
@@ -241,7 +266,11 @@ def cmd_blocked(cat, compile_sdk: int, kotlin: str, xlsx: str | None) -> int:
             continue
         reason = f"{row.get('code changes') or ''} {row.get('build result') or ''}"
         target = str(row.get("new version") or "")
-        best = bisect(cat, ref, compile_sdk, kotlin, quiet=True)
+        try:
+            best = bisect(cat, ref, compile_sdk, kotlin, quiet=True)
+        except SystemExit as e:
+            print(f"  {ref:<30} UNKNOWN  {e}")
+            continue
         current = cat.versions[ref].value
         if best is None:
             bucket, msg = "STILL BLOCKED", f"no stable version above {current} passes both gates"
@@ -276,13 +305,23 @@ def main() -> None:
 
     cat = _catalog.load()
     plat = cat.toolchain()
-    compile_sdk, kotlin = int(plat["compileSdk"]), plat["kotlin"]
+    missing = [d for d in ("compileSdk", "kotlin") if d not in plat]
+    if missing:
+        raise SystemExit(f"cannot read {', '.join(missing)} from the project - run preflight.py, or map it in "
+                         f"lib-upgrade.config.json under \"toolchainKeys\"")
+    try:
+        compile_sdk, kotlin = int(plat["compileSdk"]), plat["kotlin"]
+    except ValueError:
+        raise SystemExit(f"compileSdk {plat['compileSdk']!r} is not a whole API level")
     print(f"project: compileSdk {compile_sdk}, Kotlin {kotlin}\n")
 
     if a.blocked:
         sys.exit(cmd_blocked(cat, compile_sdk, kotlin, a.xlsx))
     if a.coord:
-        g, art, v = a.coord.split(":")
+        parts = a.coord.split(":")
+        if len(parts) != 3 or not all(parts):
+            ap.error("--coord must be group:artifact:version")
+        g, art, v = parts
         r = screen_coord(g, art, v, compile_sdk, kotlin)
         print_screen({"version": v, "verdict": r["verdict"], "results": [r], "missing": []})
         sys.exit(0 if r["verdict"] == "PASS" else 1)
@@ -295,7 +334,7 @@ def main() -> None:
     art = primary(cat, a.ref)
     v = a.version
     if not v:
-        _, published = _maven.versions(art.group, art.name)
+        published = published_or_exit(art)
         cands = _maven.stable_candidates(published, cat.versions[a.ref].value)
         if not cands:
             print(f"{a.ref}: already at the latest stable ({cat.versions[a.ref].value})")

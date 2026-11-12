@@ -83,12 +83,17 @@ def main() -> None:
     a = ap.parse_args()
 
     root = _catalog.repo_root()
+    a.run = _catalog.safe_name(a.run)
     marker = os.path.join(root, "build", "lib-upgrade", "runs", f"{a.run}.start")
     rc_file = os.path.join(root, "build", "lib-upgrade", "runs", f"{a.run}.rc")
     if not os.path.exists(marker):
         raise SystemExit(f"no start marker for run '{a.run}' - run it through run_gradle.sh first")
     since = os.path.getmtime(marker)
-    rc = open(rc_file).read().strip() if os.path.exists(rc_file) else "MISSING (still running?)"
+    if os.path.exists(rc_file):
+        with open(rc_file, encoding="utf-8") as fh:
+            rc = fh.read().strip()
+    else:
+        rc = "MISSING (still running?)"
     by_path = {p["path"]: p for p in modules.projects()}
 
     total = fails = errors = 0

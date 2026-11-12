@@ -10,6 +10,8 @@ import http.client
 import io
 import json
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -21,21 +23,73 @@ REPOS = [
     "https://plugins.gradle.org/m2",
     "https://jitpack.io",
 ]
-UNSTABLE = re.compile(r"(alpha|beta|rc|cr|dev|eap|snapshot|preview|milestone|-m\d|\.m\d|-pre)",
+# A pre-release marker is a whole word (or word + digits): "rc1", "-beta-2", "M3", "dev-1234".
+# Not a substring: "2.0.0-src", "1.0.0-device" and "3.1-arch" are stable releases.
+UNSTABLE = re.compile(r"(?<![a-z])(?:alpha|beta|rc|cr|dev|eap|snapshot|preview|milestone|prerelease|pre|m)(?![a-z])",
                       re.IGNORECASE)
 AAR_METADATA = "META-INF/com/android/build/gradle/aar-metadata.properties"
 
 
-@lru_cache(maxsize=None)
+class Unreachable(Exception):
+    """A repository could not be reached - NOT the same as the artifact not existing.
+
+    Without this distinction an offline run reads as "already the latest stable" for every library.
+    """
+
+
+MAX_BYTES = 200 * 1024 * 1024      # refuse absurd downloads instead of buffering them
+CACHE_MAX_BODY = 1024 * 1024       # larger bodies (AARs) are not kept: the cache must not grow to GBs
+_CACHE: dict[str, bytes | None] = {}
+_FAILED: set[str] = set()          # URLs whose last attempt failed for a transient reason
+_LOCK = threading.Lock()
+RETRIES = 2
+
+
+def failed(url: str) -> bool:
+    """True when the last fetch of `url` failed transiently (so None means 'unknown', not 'absent')."""
+    return url in _FAILED
+
+
 def fetch(url: str, timeout: int = 40) -> bytes | None:
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "lib-upgrade-skill"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read()
-    # IncompleteRead and friends are HTTPException, not OSError; uncaught, one dropped
-    # download aborts the whole thread-pooled scan.
-    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException):
-        return None
+    """Body of `url`, or None. A definitive miss (404) is cached; a transient failure is retried,
+    recorded in failed(), and never cached - one dropped connection must not poison the whole run."""
+    with _LOCK:
+        if url in _CACHE:
+            return _CACHE[url]
+    for attempt in range(RETRIES + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "lib-upgrade-skill"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(MAX_BYTES + 1)
+            if len(body) > MAX_BYTES:
+                body = None  # definitive: too large to be a catalog artifact
+            with _LOCK:
+                _FAILED.discard(url)
+                if body is None or len(body) <= CACHE_MAX_BODY:
+                    _CACHE[url] = body
+            return body
+        except urllib.error.HTTPError as e:
+            if e.code < 500 and e.code != 429:   # 404, 403, ... - the server answered: definitive
+                with _LOCK:
+                    _FAILED.discard(url)
+                    _CACHE[url] = None
+                return None
+        # IncompleteRead and friends are HTTPException, not OSError; uncaught, one dropped
+        # download aborts the whole thread-pooled scan.
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException):
+            pass
+        if attempt < RETRIES:
+            time.sleep(0.5 * (attempt + 1))
+    with _LOCK:
+        _FAILED.add(url)
+    return None
+
+
+def clear_cache() -> None:
+    with _LOCK:
+        _CACHE.clear()
+        _FAILED.clear()
+    versions.cache_clear()
 
 
 def path(group: str, artifact: str) -> str:
@@ -49,13 +103,24 @@ def plugin_marker(plugin_id: str) -> tuple[str, str]:
 
 @lru_cache(maxsize=None)
 def versions(group: str, artifact: str) -> tuple[str | None, list[str]]:
-    """(repo, all published versions) from the first repo that has maven-metadata.xml."""
+    """(repo, all published versions) from the first repo that has maven-metadata.xml.
+
+    Raises Unreachable when nothing was found AND a repository could not be reached: an empty
+    list then means "unknown", and must not be reported as "no newer version". (Exceptions are
+    not cached by lru_cache, so a later call retries.)
+    """
+    unreachable = []
     for repo in REPOS:
-        raw = fetch(f"{repo}/{path(group, artifact)}/maven-metadata.xml")
+        url = f"{repo}/{path(group, artifact)}/maven-metadata.xml"
+        raw = fetch(url)
         if raw:
             found = re.findall(r"<version>([^<]+)</version>", raw.decode("utf-8", "replace"))
             if found:
                 return repo, found
+        elif failed(url):
+            unreachable.append(repo)
+    if unreachable:
+        raise Unreachable(f"could not reach {', '.join(unreachable)} while looking up {group}:{artifact}")
     return None, []
 
 
@@ -73,10 +138,17 @@ def flavour(v: str) -> str:
     return m.group(1).lower() if m else ""
 
 
+def nums(v: str) -> tuple:
+    """The numeric release components exactly as written: '1.0' -> (1, 0), '1.0.0' -> (1, 0, 0)."""
+    return tuple(int(n) for n in re.findall(r"\d+", re.split(r"[-+]", v, maxsplit=1)[0]))
+
+
 def key(v: str) -> tuple:
-    """Numeric-aware sort key. Compares the numeric release components only."""
-    nums = re.findall(r"\d+", re.split(r"[-+]", v, 1)[0])
-    return tuple(int(n) for n in nums)
+    """Numeric-aware sort key. Trailing zeros are dropped so 1.0 == 1.0.0 (not 'newer')."""
+    n = list(nums(v))
+    while n and n[-1] == 0:
+        n.pop()
+    return tuple(n)
 
 
 def stable_candidates(all_versions: list[str], current: str) -> list[str]:
@@ -89,7 +161,7 @@ def stable_candidates(all_versions: list[str], current: str) -> list[str]:
 
 def tier(current: str, target: str) -> str:
     """T1 patch, T2 minor, T3 major. A 0.x minor bump is treated as major (semver)."""
-    a, b = key(current), key(target)
+    a, b = nums(current), nums(target)
     if not a or not b:
         return "T3"
     if a[0] != b[0]:
@@ -209,21 +281,50 @@ def dependencies(group: str, artifact: str, v: str) -> list[dict]:
     pom = _first(group, artifact, v, "pom")
     if pom:
         text = pom.decode("utf-8", "replace")
-        for block in re.findall(r"<dependency>(.*?)</dependency>", text, re.S):
+        props = dict(re.findall(r"<([\w.\-]+)>([^<$]*)</\1>",
+                                (re.search(r"<properties>(.*?)</properties>", text, re.S) or [None, ""])[1]))
+        props.update({"project.version": v, "version": v})
+        body = re.sub(r"<dependencyManagement>.*?</dependencyManagement>", "", text, flags=re.S)
+        for block in re.findall(r"<dependency>(.*?)</dependency>", body, re.S):
             g = re.search(r"<groupId>([^<]+)</groupId>", block)
             a = re.search(r"<artifactId>([^<]+)</artifactId>", block)
             ver = re.search(r"<version>([^<]+)</version>", block)
+            scope = re.search(r"<scope>([^<]+)</scope>", block)
+            if scope and scope.group(1).strip() in ("test", "provided", "system"):
+                continue   # not on the consumer's runtime classpath
             if g and a:
-                deps.append({"group": g.group(1), "module": a.group(1),
-                             "version": ver.group(1) if ver else None})
+                version = ver.group(1).strip() if ver else None
+                if version and version.startswith("${"):   # resolve ${prop} from this POM's <properties>
+                    version = props.get(version[2:-1]) or version
+                deps.append({"group": g.group(1), "module": a.group(1), "version": version})
     return deps
+
+
+def _concrete(version: str | None) -> bool:
+    """A version we can compare: starts with a digit (not '${prop}', not a '[1.0,2.0)' range)."""
+    return bool(version) and version[0].isdigit()
+
+
+def kotlin_stdlib_declared(group: str, artifact: str, v: str) -> tuple[list[str], bool]:
+    """(concrete kotlin-stdlib versions declared, whether one was declared that cannot be read).
+
+    The second value must make the gate UNKNOWN: a stdlib declared through a parent POM, a BOM or
+    an unresolved ${property} has a version this script cannot see, and reading that as
+    "declares none" would let exactly the dangerous artifact pass.
+    """
+    found, unresolved = set(), False
+    for d in dependencies(group, artifact, v):
+        if d["group"] == "org.jetbrains.kotlin" and (d["module"] or "").startswith("kotlin-stdlib"):
+            if _concrete(d["version"]):
+                found.add(d["version"])
+            else:
+                unresolved = True
+    return sorted(found), unresolved
 
 
 def kotlin_stdlib(group: str, artifact: str, v: str) -> list[str]:
     """kotlin-stdlib versions an artifact declares (empty when it declares none)."""
-    return sorted({d["version"] for d in dependencies(group, artifact, v)
-                   if d["group"] == "org.jetbrains.kotlin"
-                   and (d["module"] or "").startswith("kotlin-stdlib") and d["version"]})
+    return kotlin_stdlib_declared(group, artifact, v)[0]
 
 
 def release_notes_url(group: str, artifact: str, v: str) -> str:

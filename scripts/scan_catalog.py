@@ -68,7 +68,12 @@ def scan_ref(cat, ref: str) -> dict:
         return entry
     per = []
     for g, a in coords:
-        repo, published = _maven.versions(g, a)
+        try:
+            repo, published = _maven.versions(g, a)
+        except _maven.Unreachable as e:
+            entry.update(state="unresolved", note=f"repository unreachable ({e}) - NOT known to be current; "
+                         "re-run when online")
+            return entry
         cands = _maven.stable_candidates(published, v.value)
         per.append({"coord": f"{g}:{a}", "repo": repo, "latest": cands[-1] if cands else
                     (v.value if published else None)})

@@ -44,14 +44,19 @@ def classes_jar(group: str, artifact: str, v: str) -> bytes | None:
                 continue
             if ext == "jar":
                 return raw
-            zf = zipfile.ZipFile(io.BytesIO(raw))
-            return zf.read("classes.jar") if "classes.jar" in zf.namelist() else None
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(raw))
+                return zf.read("classes.jar") if "classes.jar" in zf.namelist() else None
+            except zipfile.BadZipFile:
+                print(f"warning: {g}:{a}:{ver} {ext} is not a valid zip - skipped", file=sys.stderr)
+                continue
     return None
 
 
 def extract(group: str, artifact: str, v: str, follow: bool) -> tuple[str, list[str]]:
     """Unpack the artifact (and, with follow, its same-group deps) into one class dir."""
-    dest = os.path.join(_catalog.repo_root(), WORK, f"{group}_{artifact}_{v}{'_f' if follow else ''}")
+    label = re.sub(r"[^A-Za-z0-9._-]", "_", f"{group}_{artifact}_{v}{'_f' if follow else ''}")
+    dest = os.path.join(_catalog.repo_root(), WORK, label)
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest)
     included = []
@@ -63,7 +68,11 @@ def extract(group: str, artifact: str, v: str, follow: bool) -> tuple[str, list[
     for g, a, ver in todo:
         raw = classes_jar(g, a, ver)
         if raw:
-            zipfile.ZipFile(io.BytesIO(raw)).extractall(dest)
+            try:
+                zipfile.ZipFile(io.BytesIO(raw)).extractall(dest)   # extractall drops '..' and absolute paths
+            except zipfile.BadZipFile:
+                print(f"warning: {g}:{a}:{ver} classes are not a valid zip - skipped", file=sys.stderr)
+                continue
             included.append(f"{g}:{a}:{ver} ({len(raw) // 1024} KB)")
     return dest, included
 
@@ -88,7 +97,13 @@ def main() -> None:
     a = ap.parse_args()
     if not shutil.which("javap") and not a.deps:
         raise SystemExit("javap not found - install a JDK")
-    group, artifact = a.coord.split(":")
+    parts = a.coord.split(":")
+    if len(parts) != 2 or not all(parts):
+        ap.error("coord must be group:artifact")
+    group, artifact = parts
+    for cls in a.classes:
+        if cls.startswith("-"):
+            ap.error(f"invalid class name {cls!r}")
 
     if a.deps:
         for v in (a.old, a.new):

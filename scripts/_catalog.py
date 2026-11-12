@@ -210,8 +210,22 @@ def repo_root() -> str:
     return out.stdout.strip() or os.getcwd()
 
 
+def check_rev(rev: str | None) -> None:
+    """Refuse a revision git would read as an option (`--output=...` writes files)."""
+    if rev is not None and (rev.startswith("-") or "\n" in rev or "\0" in rev):
+        raise SystemExit(f"invalid git revision {rev!r}")
+
+
+def safe_name(name: str) -> str:
+    """A run / snapshot name that cannot escape build/lib-upgrade/ (it becomes part of a file name)."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name or ""):
+        raise SystemExit(f"invalid name {name!r}: use letters, digits, . _ - and start with a letter or digit")
+    return name
+
+
 def read_file_at(path: str, rev: str | None) -> str:
     """Contents of `path` at git revision `rev`, or the working tree when rev is None."""
+    check_rev(rev)
     if rev is None:
         with open(os.path.join(repo_root(), path), encoding="utf-8") as fh:
             return fh.read()
@@ -267,7 +281,12 @@ def sdk_from_build_files() -> dict[str, str]:
              + glob.glob(os.path.join(root, "build-logic", "**", "*.gradle*"), recursive=True)
              + glob.glob(os.path.join(root, "buildSrc", "**", "*.kt"), recursive=True))
     out: dict[str, str] = {}
-    for f in files:
+
+    def priority(f: str) -> tuple:   # gradle.properties, then app/, then the rest - and always sorted
+        rel = os.path.relpath(f, root)
+        return (0 if rel == "gradle.properties" else 1 if rel.startswith("app" + os.sep) else 2, rel)
+
+    for f in sorted(set(files), key=priority):
         try:
             text = open(f, encoding="utf-8", errors="ignore").read()
         except OSError:
