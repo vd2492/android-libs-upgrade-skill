@@ -106,7 +106,7 @@ def cmd_plan(a) -> None:
             excluded.append((ref, held_by_comment(cat, ref)))
         else:
             try:
-                best = screen_gates.bisect(cat, ref, compile_sdk, kotlin, quiet=True)
+                best = screen_gates.bisect(cat, ref, compile_sdk, kotlin, quiet=True, agp=plat.get("agp"))
             except SystemExit as e:   # unreachable repo / not published: stays on the one-lib loop
                 excluded.append((ref, str(e)))
                 continue

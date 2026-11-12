@@ -28,6 +28,7 @@ import os
 import plistlib
 import re
 import sys
+from xml.parsers.expat import ExpatError
 
 TABLE_CHECKED = "2026-11-12"
 
@@ -103,7 +104,7 @@ def detect() -> list[dict]:
             try:
                 with open(os.path.join(app, "Contents", "Info.plist"), "rb") as fh:
                     version = plistlib.load(fh).get("CFBundleShortVersionString", "")
-            except (OSError, plistlib.InvalidFileException, AttributeError):
+            except (OSError, plistlib.InvalidFileException, ExpatError, AttributeError):
                 continue
             if not isinstance(version, str) or not re.match(r"^\d{4}\.\d+", version):
                 continue

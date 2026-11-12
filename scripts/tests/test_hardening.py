@@ -234,6 +234,84 @@ class InputValidationTest(InProject):
             self.assertEqual(fh.read().strip(), "7")
 
 
+class RepositoryTrustTest(InProject):
+    def test_jitpack_is_not_a_default_repository(self):
+        self.assertNotIn("https://jitpack.io", _maven.repos())
+
+    def test_extra_repos_come_from_config_and_must_be_https(self):
+        self.write("lib-upgrade.config.json",
+                   '{"extraRepos": ["https://jitpack.io/", "http://insecure.example", 5]}')
+        self.assertEqual(_maven.repos()[-1], "https://jitpack.io")
+        self.assertNotIn("http://insecure.example", _maven.repos())
+
+    def artifact(self, sha_line, suffix=".sha256"):
+        import hashlib
+        body = b"PK-fake-aar"
+        url = "https://x/lib-1.0.aar"
+        files = {url: body}
+        if sha_line is not None:
+            files[url + suffix] = sha_line(hashlib.new("sha256" if suffix == ".sha256" else "sha1", body).hexdigest()).encode()
+        with mock.patch.object(_maven, "fetch", lambda u, timeout=40: files.get(u)):
+            return _maven.fetch_verified(url), body
+
+    def test_matching_checksum_is_accepted(self):
+        got, body = self.artifact(lambda h: h + "  lib-1.0.aar\n")
+        self.assertEqual(got, body)
+        got, body = self.artifact(lambda h: h, suffix=".sha1")
+        self.assertEqual(got, body)
+
+    def test_mismatching_checksum_is_rejected(self):
+        got, _ = self.artifact(lambda h: "0" * len(h))
+        self.assertIsNone(got)
+
+    def test_missing_or_garbage_checksum_does_not_block(self):
+        self.assertIsNotNone(self.artifact(None)[0])
+        self.assertIsNotNone(self.artifact(lambda h: "<html>not found</html>")[0])
+
+
+class AgpGateTest(unittest.TestCase):
+    def gate1(self, props, agp="8.5.0"):
+        import io
+        import zipfile
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr(_maven.AAR_METADATA, props)
+        _maven.clear_cache()
+        with mock.patch.object(_maven, "fetch", FakeRepo({"/lib-1.0.aar": buf.getvalue()})):
+            return screen_gates.screen_coord("g", "lib", "1.0", 35, "2.3.20", agp)
+
+    def test_library_needing_newer_agp_fails_and_says_what_it_needs(self):
+        r = self.gate1("minCompileSdk=34\nminAndroidGradlePluginVersion=8.9.1\n")
+        self.assertEqual(r["gate1"][0], "FAIL")
+        self.assertIn(("AGP", "8.9.1"), r["needs"])
+
+    def test_same_or_older_agp_requirement_passes(self):
+        self.assertEqual(self.gate1("minCompileSdk=34\nminAndroidGradlePluginVersion=8.5.0\n")["gate1"][0], "PASS")
+        self.assertEqual(self.gate1("minCompileSdk=34\nminAndroidGradlePluginVersion=8.1.0\n")["gate1"][0], "PASS")
+
+    def test_unknown_project_agp_skips_the_check(self):
+        r = self.gate1("minCompileSdk=34\nminAndroidGradlePluginVersion=9.9.9\n", agp=None)
+        self.assertEqual(r["gate1"][0], "PASS")
+
+    def test_both_failures_are_reported(self):
+        r = self.gate1("minCompileSdk=99\nminAndroidGradlePluginVersion=9.0.0\n")
+        self.assertEqual(r["gate1"][0], "FAIL")
+        self.assertIn("minCompileSdk=99", r["gate1"][1])
+        self.assertIn("minAndroidGradlePluginVersion=9.0.0", r["gate1"][1])
+
+
+class StudioRobustnessTest(InProject):
+    def test_malformed_plist_is_skipped_not_a_crash(self):
+        import studio
+        app = os.path.join(self.dir, "Android Studio Bad.app", "Contents")
+        os.makedirs(app)
+        with open(os.path.join(app, "Info.plist"), "w") as fh:
+            fh.write("<?xml version='1.0'?><plist><dict><key>x</key>")   # truncated XML
+        with mock.patch.object(studio, "APP_GLOBS", [os.path.join(self.dir, "Android Studio*.app")]), \
+                mock.patch.object(studio, "PRODUCT_INFO_GLOBS", []):
+            self.assertEqual(studio.detect(), [])
+
+
 try:
     import openpyxl  # noqa: F401
     import tracker

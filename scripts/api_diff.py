@@ -38,8 +38,8 @@ WORK = os.path.join("build", "lib-upgrade", "api")
 def classes_jar(group: str, artifact: str, v: str) -> bytes | None:
     g, a, ver = _maven.android_variant(group, artifact, v)
     for ext in ("aar", "jar"):
-        for repo in _maven.REPOS:
-            raw = _maven.fetch(_maven.artifact_url(repo, g, a, ver, ext))
+        for repo in _maven.repos():
+            raw = _maven.fetch_verified(_maven.artifact_url(repo, g, a, ver, ext))
             if not raw:
                 continue
             if ext == "jar":

@@ -12,6 +12,9 @@ broke :app:hiltJavaCompileDebug on device - AGP consistent resolution dragged th
 classpath onto a 2.4 stdlib whose kotlin.Metadata Hilt could not read. A patch-level
 difference on the same line (hilt 2.60.1 declares 2.3.21 against our 2.3.20) is fine.
 
+Gate 1 also reads minAndroidGradlePluginVersion: a library that needs a newer AGP than the
+project's fails, and the queue then shows "AGP x needed".
+
 Usage:
     screen_gates.py <ref>                      # every library on the ref at its latest stable
     screen_gates.py <ref> --version 3.5.0      # a specific version
@@ -41,7 +44,8 @@ def line(v: str) -> tuple[int, ...]:
     return (_maven.nums(v) + (0, 0))[:2]
 
 
-def screen_coord(group: str, artifact: str, v: str, compile_sdk: int, kotlin: str) -> dict:
+def screen_coord(group: str, artifact: str, v: str, compile_sdk: int, kotlin: str,
+                 agp: str | None = None) -> dict:
     g, a, ver = _maven.android_variant(group, artifact, v)
     shown = f"{g}:{a}:{ver}"
     meta = _maven.aar_metadata(g, a, ver)
@@ -59,6 +63,11 @@ def screen_coord(group: str, artifact: str, v: str, compile_sdk: int, kotlin: st
                  ("FAIL", f"minCompileSdk={mcs} > compileSdk {compile_sdk}")
             if mcs > compile_sdk:
                 needs.append(("compileSdk", str(mcs)))
+        min_agp = str(meta.get("minAndroidGradlePluginVersion", "")).strip()
+        if agp and min_agp and _maven.nums(min_agp) and (_maven.nums(min_agp) + (0, 0, 0))[:3] > (_maven.nums(agp) + (0, 0, 0))[:3]:
+            msg = f"minAndroidGradlePluginVersion={min_agp} > project AGP {agp}"
+            g1 = ("FAIL", msg if g1[0] == "PASS" else f"{g1[1]}; {msg}")
+            needs.append(("AGP", min_agp))
     elif status in ("none", "jar"):
         g1 = ("PASS", "no AAR metadata (unconstrained)" if status == "none" else "plain JAR")
     else:
@@ -100,7 +109,7 @@ def same_group_pulls(group: str, artifact: str, v: str) -> list[tuple[str, str]]
     return out[:25]
 
 
-def screen_ref_at(cat, ref: str, v: str, compile_sdk: int, kotlin: str) -> dict:
+def screen_ref_at(cat, ref: str, v: str, compile_sdk: int, kotlin: str, agp: str | None = None) -> dict:
     """Every non-plugin library on `ref` at version `v`, plus what each forces. All must pass."""
     arts = [x for x in cat.artifacts_for(ref) if not x.is_plugin and x.group and x.name]
     results, missing, seen = [], [], set()
@@ -123,17 +132,17 @@ def screen_ref_at(cat, ref: str, v: str, compile_sdk: int, kotlin: str) -> dict:
                                 "gate1": ("UNKNOWN", "BOM pins nothing this catalog uses"),
                                 "gate2": ("UNKNOWN", "-")})
             for mg, ma, mv in members:
-                r = screen_coord(mg, ma, mv, compile_sdk, kotlin)
+                r = screen_coord(mg, ma, mv, compile_sdk, kotlin, agp)
                 r["coord"] += f"  (pinned by {art.name} {v})"
                 results.append(r)
             continue
-        results.append(screen_coord(art.group, art.name, v, compile_sdk, kotlin))
+        results.append(screen_coord(art.group, art.name, v, compile_sdk, kotlin, agp))
         seen.add((art.name, v))
         for mod, dv in same_group_pulls(art.group, art.name, v):
             if (mod, dv) in seen:
                 continue
             seen.add((mod, dv))
-            r = screen_coord(art.group, mod, dv, compile_sdk, kotlin)
+            r = screen_coord(art.group, mod, dv, compile_sdk, kotlin, agp)
             if r["verdict"] == "FAIL":  # only a failing pulled-in artifact is worth reporting
                 r["coord"] += "  (pulled in by constraint)"
                 results.append(r)
@@ -177,7 +186,7 @@ def dependencies_of(s: dict) -> list[str]:
     who: dict[str, list[str]] = {}
     for r in s["results"]:
         for kind, val in r.get("needs", []):
-            k = tuple(int(x) for x in val.split("."))
+            k = _maven.nums(val)
             if kind not in best or k > best[kind]:
                 best[kind] = k
             parts = r["coord"].split("  (")[0].split(":")
@@ -219,7 +228,8 @@ def print_studio(ref: str, version: str) -> None:
     print(f"=> lint pairs with AGP {version} at {studio.lint_for(version)}")
 
 
-def bisect(cat, ref: str, compile_sdk: int, kotlin: str, quiet: bool = False) -> str | None:
+def bisect(cat, ref: str, compile_sdk: int, kotlin: str, quiet: bool = False,
+           agp: str | None = None) -> str | None:
     art = primary(cat, ref)
     current = cat.versions[ref].value
     published = published_or_exit(art)
@@ -229,7 +239,7 @@ def bisect(cat, ref: str, compile_sdk: int, kotlin: str, quiet: bool = False) ->
             print(f"{ref}: {current} is already the latest stable")
         return None
     with ThreadPoolExecutor(max_workers=6) as pool:
-        screens = list(pool.map(lambda v: screen_ref_at(cat, ref, v, compile_sdk, kotlin),
+        screens = list(pool.map(lambda v: screen_ref_at(cat, ref, v, compile_sdk, kotlin, agp),
                                 reversed(cands)))
     best = next((s["version"] for s in screens if s["verdict"] == "PASS"), None)
     if not quiet:
@@ -249,7 +259,7 @@ def bisect(cat, ref: str, compile_sdk: int, kotlin: str, quiet: bool = False) ->
     return best
 
 
-def cmd_blocked(cat, compile_sdk: int, kotlin: str, xlsx: str | None) -> int:
+def cmd_blocked(cat, compile_sdk: int, kotlin: str, xlsx: str | None, agp: str | None = None) -> int:
     import tracker
     path = tracker.xlsx_path(xlsx)
     blocked = [row for _, row in tracker.rows_all(path) if row.get("status") == "blocked"]
@@ -267,7 +277,7 @@ def cmd_blocked(cat, compile_sdk: int, kotlin: str, xlsx: str | None) -> int:
         reason = f"{row.get('code changes') or ''} {row.get('build result') or ''}"
         target = str(row.get("new version") or "")
         try:
-            best = bisect(cat, ref, compile_sdk, kotlin, quiet=True)
+            best = bisect(cat, ref, compile_sdk, kotlin, quiet=True, agp=agp)
         except SystemExit as e:
             print(f"  {ref:<30} UNKNOWN  {e}")
             continue
@@ -316,13 +326,13 @@ def main() -> None:
     print(f"project: compileSdk {compile_sdk}, Kotlin {kotlin}\n")
 
     if a.blocked:
-        sys.exit(cmd_blocked(cat, compile_sdk, kotlin, a.xlsx))
+        sys.exit(cmd_blocked(cat, compile_sdk, kotlin, a.xlsx, plat.get("agp")))
     if a.coord:
         parts = a.coord.split(":")
         if len(parts) != 3 or not all(parts):
             ap.error("--coord must be group:artifact:version")
         g, art, v = parts
-        r = screen_coord(g, art, v, compile_sdk, kotlin)
+        r = screen_coord(g, art, v, compile_sdk, kotlin, plat.get("agp"))
         print_screen({"version": v, "verdict": r["verdict"], "results": [r], "missing": []})
         sys.exit(0 if r["verdict"] == "PASS" else 1)
     if not a.ref:
@@ -330,7 +340,7 @@ def main() -> None:
     if a.ref not in cat.versions:
         raise SystemExit(f"'{a.ref}' is not a [versions] key in the catalog")
     if a.bisect:
-        sys.exit(0 if bisect(cat, a.ref, compile_sdk, kotlin) else 1)
+        sys.exit(0 if bisect(cat, a.ref, compile_sdk, kotlin, agp=plat.get("agp")) else 1)
     art = primary(cat, a.ref)
     v = a.version
     if not v:
@@ -340,7 +350,7 @@ def main() -> None:
             print(f"{a.ref}: already at the latest stable ({cat.versions[a.ref].value})")
             sys.exit(0)
         v = cands[-1]
-    s = screen_ref_at(cat, a.ref, v, compile_sdk, kotlin)
+    s = screen_ref_at(cat, a.ref, v, compile_sdk, kotlin, plat.get("agp"))
     print(f"{a.ref} @ {v}:")
     print_screen(s)
     print_studio(a.ref, v)

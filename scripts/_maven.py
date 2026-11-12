@@ -6,10 +6,12 @@ window of versions and silently reported 11 outdated libraries as current.
 """
 from __future__ import annotations
 
+import hashlib
 import http.client
 import io
 import json
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -17,12 +19,23 @@ import urllib.request
 import zipfile
 from functools import lru_cache
 
+# jitpack.io is NOT a default: it builds arbitrary GitHub repositories on demand, so anyone can
+# publish a lookalike artifact there. A project that really needs it lists it in
+# lib-upgrade.config.json:  {"extraRepos": ["https://jitpack.io"]}
 REPOS = [
     "https://dl.google.com/dl/android/maven2",
     "https://repo1.maven.org/maven2",
     "https://plugins.gradle.org/m2",
-    "https://jitpack.io",
 ]
+
+
+def repos() -> list[str]:
+    """Default repositories plus the project's own https `extraRepos` from lib-upgrade.config.json."""
+    import _catalog
+    extra = _catalog.config().get("extraRepos", [])
+    extra = [r.rstrip("/") for r in extra if isinstance(r, str) and r.startswith("https://")] \
+        if isinstance(extra, list) else []
+    return REPOS + [r for r in extra if r not in REPOS]
 # A pre-release marker is a whole word (or word + digits): "rc1", "-beta-2", "M3", "dev-1234".
 # Not a substring: "2.0.0-src", "1.0.0-device" and "3.1-arch" are stable releases.
 UNSTABLE = re.compile(r"(?<![a-z])(?:alpha|beta|rc|cr|dev|eap|snapshot|preview|milestone|prerelease|pre|m)(?![a-z])",
@@ -110,7 +123,7 @@ def versions(group: str, artifact: str) -> tuple[str | None, list[str]]:
     not cached by lru_cache, so a later call retries.)
     """
     unreachable = []
-    for repo in REPOS:
+    for repo in repos():
         url = f"{repo}/{path(group, artifact)}/maven-metadata.xml"
         raw = fetch(url)
         if raw:
@@ -177,9 +190,37 @@ def artifact_url(repo: str, group: str, artifact: str, v: str, ext: str) -> str:
     return f"{repo}/{path(group, artifact)}/{v}/{artifact}-{v}.{ext}"
 
 
+def verified(url: str, body: bytes | None) -> bytes | None:
+    """`body` if it matches the repository's published .sha256 / .sha1 (or none is published).
+
+    Transport is HTTPS, so this guards against a corrupted or swapped artifact on a mirror, not a
+    compromised repository. A mismatch returns None and warns - it is never silently accepted.
+    """
+    if not body:
+        return body
+    for suffix, algo in ((".sha256", "sha256"), (".sha1", "sha1")):
+        text = fetch(url + suffix)
+        if not text:
+            continue
+        words = text.decode("ascii", "replace").split()
+        expected = words[0].lower() if words else ""
+        if not re.fullmatch(r"[0-9a-f]{40,64}", expected):
+            continue   # an HTML error page served with 200, not a checksum
+        if hashlib.new(algo, body).hexdigest() != expected:
+            print(f"warning: checksum mismatch for {url} - download ignored", file=sys.stderr)
+            return None
+        return body
+    return body
+
+
+def fetch_verified(url: str) -> bytes | None:
+    return verified(url, fetch(url))
+
+
 def _first(group: str, artifact: str, v: str, ext: str) -> bytes | None:
-    for repo in REPOS:
-        raw = fetch(artifact_url(repo, group, artifact, v, ext))
+    for repo in repos():
+        url = artifact_url(repo, group, artifact, v, ext)
+        raw = fetch_verified(url) if ext in ("aar", "jar") else fetch(url)
         if raw:
             return raw
     return None
