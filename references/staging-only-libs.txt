@@ -1,0 +1,4 @@
+# Libraries whose code only runs in a staging/release build (a Gradle plugin that skips debug,
+# or code behind a build type), so a debug build proves nothing about them.
+# One per line:  <catalog version key>  # why. They are kept out of patch batches and the
+# skill tells the user which variant to build. Empty is fine.

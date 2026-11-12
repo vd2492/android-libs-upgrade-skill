@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Secrets / local config
+.env
+.env.*
+local.properties
+*.jks
+*.keystore
+
+# Logs / temp
+*.log
+*.tmp
