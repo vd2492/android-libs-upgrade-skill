@@ -28,14 +28,23 @@ It never builds the app or commits without your go-ahead.
 
 ### Claude Code
 
-Copy this folder into a skills directory, keeping the folder name `android-libs-upgrade`:
+**Option A - one command (clone):**
 
 ```bash
-# for one project
-mkdir -p <project>/.claude/skills && cp -R android-libs-upgrade-skill <project>/.claude/skills/android-libs-upgrade
-# or for every project on this machine
-mkdir -p ~/.claude/skills && cp -R android-libs-upgrade-skill ~/.claude/skills/android-libs-upgrade
+git clone https://github.com/vd2492/android-libs-upgrade-skill ~/.claude/skills/android-libs-upgrade
 ```
+
+For one project only, clone into `<project>/.claude/skills/android-libs-upgrade` instead.
+Update with `git pull` inside that folder.
+
+**Option B - plugin marketplace (managed updates):** run inside Claude Code:
+
+```
+/plugin marketplace add vd2492/android-libs-upgrade-skill
+/plugin install android-libs-upgrade@android-libs-upgrade-skill
+```
+
+Update with `/plugin update`, remove with `/plugin uninstall`. Use one option, not both.
 
 Then ask: "upgrade the libs", "bump AGP", "why is X blocked?" - the skill loads on its own, or
 invoke it by name.

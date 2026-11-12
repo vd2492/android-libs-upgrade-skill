@@ -1,0 +1,22 @@
+{
+  "name": "android-libs-upgrade-skill",
+  "owner": {
+    "name": "vd2492"
+  },
+  "plugins": [
+    {
+      "name": "android-libs-upgrade",
+      "description": "Upgrade an Android app's SDK, Gradle toolchain and version-catalog libraries one at a time, with gates, changelog review, tests and a resumable tracker.",
+      "version": "1.0.0",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./"
+      ],
+      "homepage": "https://github.com/vd2492/android-libs-upgrade-skill"
+    }
+  ],
+  "metadata": {
+    "description": "Skill for safely upgrading an Android app's SDK, Gradle toolchain and libraries"
+  }
+}
